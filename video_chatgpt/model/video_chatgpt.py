@@ -10,12 +10,18 @@ DEFAULT_VIDEO_PATCH_TOKEN = "<vid_patch>"
 DEFAULT_VID_START_TOKEN = "<vid_start>"
 DEFAULT_VID_END_TOKEN = "<vid_end>"
 
+DEFAULT_POSE_TOKEN = "<human_pose>"
+DEFAULT_POSE_PATCH_TOKEN = "<pose_patch>"
+DEFAULT_POSE_START_TOKEN = "<pose_start>"
+DEFAULT_POSE_END_TOKEN = "<pose_end>"
+
 
 class VisionConfig:
     def __init__(self):
         self.frame_size = 224
         self.patch_size = 14
-        self.hidden_size = 1024
+        self.hidden_size = 1024 # the shape of the features from the vision encoder
+        self.hidden_size_pose = 216 # the shape of the features from the vision encoder
         self.use_vid_start_end = None
         self.vid_start_token = None
         self.vid_end_token = None
@@ -37,6 +43,7 @@ class VideoChatGPTLlamaModel(LlamaModel):
 
         if hasattr(config, "use_mm_proj"):
             self.mm_projector = nn.Linear(config.mm_hidden_size, config.hidden_size)
+            self.mm_projector_forpose = nn.Linear(self.vision_config.hidden_size_pose, config.hidden_size) # ! There are a lot of lines doing things to mm_projector (above). I am not implementing them for mm_projector_forpose for now
 
     def initialize_vision_modules(self, pretrain_mm_mlp_adapter=None, tune_mm_mlp_adapter=False):
         vision_config = self.vision_config
@@ -44,6 +51,7 @@ class VideoChatGPTLlamaModel(LlamaModel):
 
         self.config.use_mm_proj = True
         self.config.mm_hidden_size = vision_config.hidden_size
+        self.config.mm_hidden_size_pose = vision_config.hidden_size_pose
 
         if not hasattr(self, 'mm_projector'):
             self.mm_projector = nn.Linear(vision_config.hidden_size, self.config.hidden_size)
@@ -51,6 +59,7 @@ class VideoChatGPTLlamaModel(LlamaModel):
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
             self.mm_projector.load_state_dict({k.split('.')[-1]: v for k, v in mm_projector_weights.items()})
+            self.mm_projector_forpose.load_state_dict({k.split('.')[-1]: v for k, v in mm_projector_weights.items()})
 
         return dict(
             video_token_len=num_patches,
@@ -67,6 +76,7 @@ class VideoChatGPTLlamaModel(LlamaModel):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             video_spatio_temporal_features: Optional[torch.FloatTensor] = None,
+            pose_features: Optional[torch.FloatTensor] = None,
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         orig_embeds_params = getattr(self, 'orig_embeds_params', None)
@@ -85,41 +95,72 @@ class VideoChatGPTLlamaModel(LlamaModel):
                                                dtype=inputs_embeds.dtype)
             dummy_video_features = self.mm_projector(dummy_video_features)
 
+            pose_features_projected = self.mm_projector_forpose(pose_features)
+
             new_input_embeds = []
             cur_video_idx = 0
+
             for cur_input_ids, cur_input_embeds in zip(input_ids, inputs_embeds):
                 if (cur_input_ids == self.vision_config.vid_patch_token).sum() == 0:
+                    raise NotImplementedError("Didnt expect this, the video was empty. If this error is raised then implement this for pose aswell")
                     # Multimodal LLM, but the current sample is not multimodal
                     cur_input_embeds = cur_input_embeds + (0. * dummy_video_features).sum()
                     new_input_embeds.append(cur_input_embeds)
                     cur_video_idx += 1
                     continue
-                if self.vision_config.use_vid_start_end:
+                
+                '''
+                Initially, the input_embeds are the embeddings of the tokens in the input_ids. This means that the special video and pose tokens (e.g., <vid_patch> and <pose_start>) were processed like words (and the embeddings are the representations from the model).
+
+                Below, we replace the embeddings of the video and pose tokens with the actual video and pose features. We do this by finding the positions of the video and pose tokens in the input_ids, and then replacing the embeddings of the tokens at those positions with the video and pose features.
+                '''
+                if self.vision_config.use_vid_start_end: # This is true in the config we use
                     if (cur_input_ids == self.vision_config.vid_start_token).sum() != (
                             cur_input_ids == self.vision_config.vid_end_token).sum():
                         raise ValueError("The number of video start tokens and video end tokens should be the same.")
                     video_start_tokens = torch.where(cur_input_ids == self.vision_config.vid_start_token)[0]
                     for video_start_token_pos in video_start_tokens:
                         cur_video_features = video_features[cur_video_idx].to(device=cur_input_embeds.device)
-                        num_patches = cur_video_features.shape[0]
+                        cur_pose_features = pose_features_projected[cur_video_idx].to(device=cur_input_embeds.device)
+
+                        num_patches = cur_video_features.shape[0] # the number of video features
+                        num_pose_patches = cur_pose_features.shape[0] # the number of pose features
+
                         if cur_input_ids[video_start_token_pos + num_patches + 1] != self.vision_config.vid_end_token:
                             raise ValueError("The video end token should follow the video start token.")
                         if orig_embeds_params is not None:
-                            cur_new_input_embeds = torch.cat((cur_input_embeds[:video_start_token_pos].detach(),
-                                                              cur_input_embeds[
-                                                              video_start_token_pos:video_start_token_pos + 1],
-                                                              cur_video_features, cur_input_embeds[
-                                                                                  video_start_token_pos + num_patches
-                                                                                  + 1:video_start_token_pos
-                                                                                  + num_patches + 2],
-                                                              cur_input_embeds[
-                                                              video_start_token_pos + num_patches + 2:].detach()),
-                                                             dim=0)
+                            # ! Get pose embeddings relative to video embedding
+                            pose_start_token_idx = video_start_token_pos + num_patches + 2
+                            pose_end_token_idx = pose_start_token_idx + num_pose_patches + 1
+                            cur_new_input_embeds = torch.cat((cur_input_embeds[:video_start_token_pos].detach(), # everything before vid 
+                                                                cur_input_embeds[
+                                                                video_start_token_pos:video_start_token_pos + 1], # vid_start token
+                                                                cur_video_features, # the video features
+                                                                cur_input_embeds[
+                                                                    video_start_token_pos + num_patches
+                                                                    + 1:video_start_token_pos
+                                                                    + num_patches + 2], # vid_end token
+                                                                cur_input_embeds[pose_start_token_idx:pose_start_token_idx + 1], # pose_start token
+                                                                cur_pose_features, # the pose features
+                                                                cur_input_embeds[pose_end_token_idx:pose_end_token_idx + 1], # pose_end token
+                                                                cur_input_embeds[
+                                                                pose_end_token_idx + 1:].detach()), # everything after pose
+                                                                dim=0)
+                            # ! The shapes arent the same, im not sure if they should be. TODO: Check later
+                            # cur_new_input_embeds_TEST = torch.cat((cur_input_embeds[:video_start_token_pos + 1], # everything before vid
+                            #                                     cur_video_features, # the video features
+                            #                                     cur_input_embeds[video_start_token_pos + num_patches + 1:pose_start_token_idx], # everything after vid and before pose
+                            #                                     cur_pose_features, # the pose features
+                            #                                     cur_input_embeds[pose_end_token_idx + 1:]), dim=0) # everything after pose
+                            # breakpoint()
                         else:
-                            cur_new_input_embeds = torch.cat((cur_input_embeds[:video_start_token_pos + 1],
-                                                              cur_video_features,
-                                                              cur_input_embeds[video_start_token_pos
-                                                                               + num_patches + 1:]), dim=0)
+                            pose_start_token_idx = video_start_token_pos + num_patches + 2
+                            pose_end_token_idx = pose_start_token_idx + num_pose_patches + 1
+                            cur_new_input_embeds = torch.cat((cur_input_embeds[:video_start_token_pos + 1], # everything before vid
+                                                                cur_video_features, # the video features
+                                                                cur_input_embeds[video_start_token_pos + num_patches + 1:pose_start_token_idx], # everything after vid and before pose
+                                                                cur_pose_features, # the pose features
+                                                                cur_input_embeds[pose_end_token_idx + 1:]), dim=0) # everything after pose
                         cur_video_idx += 1
                     new_input_embeds.append(cur_new_input_embeds)
                 else:
@@ -179,6 +220,7 @@ class VideoChatGPTLlamaForCausalLM(LlamaForCausalLM):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             video_spatio_temporal_features: Optional[torch.FloatTensor] = None,
+            pose_features: Optional[torch.FloatTensor] = None,
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -197,7 +239,8 @@ class VideoChatGPTLlamaForCausalLM(LlamaForCausalLM):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            video_spatio_temporal_features=video_spatio_temporal_features
+            video_spatio_temporal_features=video_spatio_temporal_features,
+            pose_features=pose_features
         )
 
         hidden_states = outputs[0]
@@ -246,22 +289,26 @@ class VideoChatGPTLlamaForCausalLM(LlamaForCausalLM):
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "video_spatio_temporal_features": kwargs.get("video_spatio_temporal_features", None),
+                "pose_features": kwargs.get("pose_features", None)
             }
         )
+        breakpoint()
         return model_inputs
 
     def initialize_vision_tokenizer(self, mm_use_vid_start_end, tokenizer, device,
                                     tune_mm_mlp_adapter=False, pretrain_mm_mlp_adapter=None):
         vision_config = self.get_model().vision_config
         vision_config.use_vid_start_end = mm_use_vid_start_end
-        tokenizer.add_tokens([DEFAULT_VIDEO_PATCH_TOKEN], special_tokens=True)
+        tokenizer.add_tokens([DEFAULT_VIDEO_PATCH_TOKEN, DEFAULT_POSE_PATCH_TOKEN], special_tokens=True) # ! Add pose tokens
         self.resize_token_embeddings(len(tokenizer))
 
         if mm_use_vid_start_end:
-            num_new_tokens = tokenizer.add_tokens([DEFAULT_VID_START_TOKEN, DEFAULT_VID_END_TOKEN], special_tokens=True)
+            num_new_tokens = tokenizer.add_tokens([DEFAULT_VID_START_TOKEN, DEFAULT_VID_END_TOKEN, DEFAULT_POSE_START_TOKEN, DEFAULT_POSE_END_TOKEN], special_tokens=True) # ! Add pose tokens
             self.resize_token_embeddings(len(tokenizer))
             vision_config.vid_start_token, vision_config.vid_end_token = tokenizer.convert_tokens_to_ids(
                 [DEFAULT_VID_START_TOKEN, DEFAULT_VID_END_TOKEN])
+            vision_config.pose_start_token, vision_config.pose_end_token = tokenizer.convert_tokens_to_ids(
+                [DEFAULT_POSE_START_TOKEN, DEFAULT_POSE_END_TOKEN])
 
             if num_new_tokens > 0:
                 input_embeddings = self.get_input_embeddings().weight.data
@@ -297,6 +344,7 @@ class VideoChatGPTLlamaForCausalLM(LlamaForCausalLM):
                         f"Current: {input_embeddings.shape}. Numer of new tokens: {num_new_tokens}.")
 
         vision_config.vid_patch_token = tokenizer.convert_tokens_to_ids([DEFAULT_VIDEO_PATCH_TOKEN])[0]
+        vision_config.pose_patch_token = tokenizer.convert_tokens_to_ids([DEFAULT_POSE_PATCH_TOKEN])[0]
 
 
 AutoConfig.register("VideoChatGPT", VideoChatGPTConfig)

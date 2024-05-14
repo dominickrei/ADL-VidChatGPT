@@ -154,15 +154,20 @@ def _add_speaker_and_signal(header, source, get_conversation=True):
 def preprocess_multimodal(
         sources: Sequence[str],
         multimodal_cfg: dict,
-        cur_token_len: int,
+        cur_video_token_len: int,
+        cur_pose_token_len: int
 ) -> Dict:
     is_multimodal = multimodal_cfg['is_multimodal']
-    video_token_len = cur_token_len
+    
+    video_token_len = cur_video_token_len
+    pose_token_len = cur_pose_token_len
+
     if not is_multimodal:
         return sources
 
     for source in sources:
-        if multimodal_cfg['sep_video_conv_front']:
+        if multimodal_cfg['sep_video_conv_front']: # Dominick: In default cfg this is false
+            raise NotImplementedError("Not implemented for poses yet")
             assert DEFAULT_VIDEO_TOKEN in source[0]['value']
             source[0]['value'] = source[0]['value'].replace(DEFAULT_VIDEO_TOKEN, '').strip()
             source[0]['value'] = DEFAULT_VIDEO_TOKEN + conversation_lib.default_conversation.sep + \
@@ -172,6 +177,12 @@ def preprocess_multimodal(
             if multimodal_cfg['use_vid_start_end']:
                 replace_token = DEFAULT_VID_START_TOKEN + replace_token + DEFAULT_VID_END_TOKEN
             sentence["value"] = sentence["value"].replace(DEFAULT_VIDEO_TOKEN, replace_token)
+
+        for sentence in source:
+            replace_token = DEFAULT_POSE_PATCH_TOKEN * pose_token_len
+            if multimodal_cfg['use_vid_start_end']: # use video config for pose as well
+                replace_token = DEFAULT_POSE_START_TOKEN + replace_token + DEFAULT_POSE_END_TOKEN
+            sentence["value"] = sentence["value"].replace(DEFAULT_POSE_TOKEN, replace_token)
 
     return sources
 
@@ -334,6 +345,8 @@ def preprocess(
         return preprocess_v1(sources, tokenizer)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer)
+
+    assert False, "Unexpected" # conversation_lib.default_conversation.version is v1 when I checked (Dominick)
     # add end signal and concatenate together
     conversations = []
     for source in sources:
@@ -399,20 +412,28 @@ class LazySupervisedDataset(Dataset):
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
-        if 'video' in sources[0]:
+
+        if 'video' in sources[0]: # Assuming pose is only present if a video is present
             video_file = self.list_data_dict[i]['video']
             video_folder = self.multimodal_cfg['video_folder']
             with open(f"{video_folder}/{video_file}", "rb") as f:
                 features = pickle.load(f)
 
-            cur_token_len = 356  # 100 temporal + 256 spatial, TODO: Hard Coding is not good
+            # DEBUG: Creating fake pose features for testing. Shape should be (75, 216)
+            pose_features = torch.randn(75, 216).numpy().astype(features.dtype)
+
+            # cur_token_len = 356  # 100 temporal + 256 spatial, TODO: Hard Coding is not good
+            cur_video_token_len = 356  # 100 temporal + 256 spatial, TODO: Hard Coding is not good
+            cur_pose_token_len = 256
+
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
-                self.multimodal_cfg, cur_token_len)
-
+                self.multimodal_cfg, cur_video_token_len, cur_pose_token_len)
+        
         data_dict = preprocess(
             sources,
             self.tokenizer)
+        
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
@@ -420,6 +441,9 @@ class LazySupervisedDataset(Dataset):
         # video exist in the data
         if 'video' in self.list_data_dict[i]:
             data_dict["video"] = features
+        
+        if True: # DEBUG: If there are pose features
+            data_dict["pose"] = pose_features
 
         return data_dict
 
@@ -446,12 +470,19 @@ class DataCollatorForSupervisedDataset(object):
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
-        if 'video' in instances[0]:
+        if 'video' in instances[0]: # TODO: Assuming pose is only present if video is present
             features = [torch.tensor(instance['video']) for instance in instances]
+            pose_features = [torch.tensor(instance['pose']) for instance in instances]
+
             if all(x is not None and x.shape == features[0].shape for x in features):
                 batch['video_spatio_temporal_features'] = torch.stack(features)
             else:
                 batch['video_spatio_temporal_features'] = features
+
+            if all(x is not None and x.shape == pose_features[0].shape for x in pose_features):
+                batch['pose_features'] = torch.stack(pose_features)
+            else:
+                batch['pose_features'] = pose_features
 
         return batch
 
@@ -486,6 +517,7 @@ def train():
         cache_dir=training_args.cache_dir,
         # torch_dtype=torch.bfloat16 if training_args.bf16 else torch.float,
     )
+
     model.config.use_cache = False
 
     if model_args.freeze_backbone:
@@ -551,7 +583,7 @@ def train():
 
             FSDP.__init__ = patch_FSDP_use_orig_params(FSDP.__init__)
 
-    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args) # this is the dataset
     training_args.report_to = []
     # training_args.max_steps = 10
     trainer = VideoChatGPTTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)

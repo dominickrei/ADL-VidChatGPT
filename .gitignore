@@ -1,0 +1,6 @@
+LLaVA-7B-Lightening-v1-1/
+__pycache__/
+NTU_combination_video_features/
+cmds
+flash-attention/
+debugging.ipynb

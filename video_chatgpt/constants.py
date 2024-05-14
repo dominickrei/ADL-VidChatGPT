@@ -9,3 +9,8 @@ DEFAULT_VIDEO_TOKEN = "<video>"
 DEFAULT_VIDEO_PATCH_TOKEN = "<vid_patch>"
 DEFAULT_VID_START_TOKEN = "<vid_start>"
 DEFAULT_VID_END_TOKEN = "<vid_end>"
+
+DEFAULT_POSE_TOKEN = "<human_pose>"
+DEFAULT_POSE_PATCH_TOKEN = "<pose_patch>"
+DEFAULT_POSE_START_TOKEN = "<pose_start>"
+DEFAULT_POSE_END_TOKEN = "<pose_end>"
